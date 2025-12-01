@@ -270,7 +270,7 @@ def run_committee_meeting(openai_client, gemini_key, winner_data, horizon):
         temperature=0.1
     ).choices[0].message.content
 
-    # --- AGENT 4: THE CIO ---
+# --- AGENT 4: THE CIO ---
     cio_prompt = f"""
     Role: Chief Investment Officer.
     
@@ -288,11 +288,16 @@ def run_committee_meeting(openai_client, gemini_key, winner_data, horizon):
     
     Tone: Directive. No fluff.
     """
-    final_verdict = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": cio_prompt}],
-        temperature=0.0
-    ).choices[0].message.content
+
+    # UPDATED: Integration of GPT-5.1 using the new responses API
+    try:
+        response = openai_client.responses.create(
+            model="gpt-5.1",
+            input=cio_prompt
+        )
+        final_verdict = response.output_text
+    except Exception as e:
+        final_verdict = f"CIO Error: {str(e)}"
     
     return {
         "raw_news": full_news_text, 
