@@ -60,6 +60,7 @@ def get_google_news(ticker, limit=5):
         return [f"News Error: {str(e)}"]
 
 # --- STAGE 1: MATH FILTER (WEIGHTED SCORECARD FIX) ---
+# --- STAGE 1: MATH FILTER (WEIGHTED SCORECARD FIX) ---
 def run_quantitative_dragnet(tickers, horizon, progress_bar):
     if not tickers:
         return []
@@ -146,9 +147,10 @@ def run_quantitative_dragnet(tickers, horizon, progress_bar):
                 })
         except: continue
             
-    # Return TOP 60 (Expanded pool for AI)
+    # Return ALL candidates that passed the score threshold
+    # No more hard limit of 60.
     candidates.sort(key=lambda x: x['math_score'], reverse=True)
-    return candidates[:60] 
+    return candidates
 
 # --- STAGE 2: JUNIOR ANALYST ---
 def run_junior_analyst_batch(client, candidates, progress_bar):
