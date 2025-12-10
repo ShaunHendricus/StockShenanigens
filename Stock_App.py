@@ -10,6 +10,7 @@ from datetime import timedelta
 import feedparser
 import ast
 import re
+import io 
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Institutional Committee", layout="wide", page_icon="⚖️")
@@ -314,7 +315,7 @@ def analyze_price_action(client, stock_data, is_gain):
     except:
         return {"explanation": "Analysis failed.", "forecast": "Unknown", "bull_target": 0, "bear_target": 0, **stock_data}
 
-# --- WEEKLY EARNINGS ENGINE (NEW - SCRAPER VERSION) ---
+# --- WEEKLY EARNINGS ENGINE (FIXED & UNIFIED) ---
 def get_next_trading_days(start_date, n_days=5):
     """Returns a list of the next N trading days (skipping weekends)."""
     trading_days = []
@@ -334,43 +335,50 @@ def get_weekly_earnings_calendar(progress_bar):
     
     earnings_map = {}
     
-    # Session for robust requests
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
+    # Track tickers seen across the ENTIRE week to prevent duplicates if Yahoo redirects to 'Today'
+    seen_tickers_week = set()
 
     for d in target_days:
         date_str = d.strftime('%Y-%m-%d')
-        display_day = d.strftime("%A")
-        earnings_map[d] = {"morning": [], "evening": []}
+        # Initialize a single list for the day, not split by time
+        earnings_map[d] = []
         
         # Scrape Yahoo Finance for this specific day
         url = f"https://finance.yahoo.com/calendar/earnings?day={date_str}"
         
         try:
-            # We use pandas read_html which is very powerful for tables
-            # It needs lxml or html5lib installed in environment usually, or bs4
-            response = session.get(url)
-            dfs = pd.read_html(response.text)
+            # Use a fresh request for each day to prevent stale sessions
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            response = requests.get(url, headers=headers)
             
+            # Robust HTML reading with io.StringIO
+            try:
+                dfs = pd.read_html(io.StringIO(response.text))
+            except ValueError:
+                # No tables found on the page
+                continue
+
             if not dfs: continue
             df = dfs[0] # The main earnings table
             
-            # Columns usually: Symbol, Company, Earnings Call Time, EPS Estimate, Reported EPS, Surprise(%)
-            # We need Symbol and Time
+            # Validate columns and drop bad rows
+            if 'Symbol' not in df.columns: continue
             
+            # Drop rows where Symbol is NaN
+            df = df.dropna(subset=['Symbol'])
             if df.empty: continue
             
-            # Batch fetch market caps for sorting
-            # Get list of symbols from this page
-            symbols = df['Symbol'].tolist()
+            # Ensure symbols are strings before processing
+            df['Symbol'] = df['Symbol'].astype(str)
             
+            # Batch fetch market caps for sorting
+            symbols = df['Symbol'].tolist()
             # Clean symbols (remove dots for yfinance)
             clean_symbols = [s.replace('.', '-') for s in symbols]
             
             # Fetch info in batch to get Market Caps
-            # We chunk it to avoid URL length issues
             chunk_size = 100
             symbol_cap_map = {}
             
@@ -380,7 +388,6 @@ def get_weekly_earnings_calendar(progress_bar):
                     tickers = yf.Tickers(" ".join(chunk))
                     for sym in chunk:
                         try:
-                            # Tickers.tickers is a dict
                             info = tickers.tickers[sym].info
                             cap = info.get('marketCap', 0)
                             symbol_cap_map[sym] = cap
@@ -391,22 +398,34 @@ def get_weekly_earnings_calendar(progress_bar):
             # Process row by row
             for index, row in df.iterrows():
                 try:
-                    ticker = row['Symbol'].replace('.', '-')
+                    raw_symbol = row['Symbol']
+                    if not isinstance(raw_symbol, str): continue
+                    
+                    ticker = raw_symbol.replace('.', '-')
+
+                    # GLOBAL WEEKLY DUPLICATION CHECK
+                    # If we saw this ticker on a previous day in this loop, skip it.
+                    if ticker in seen_tickers_week:
+                        continue
+                    seen_tickers_week.add(ticker)
+
                     time_str = str(row.get('Earnings Call Time', 'Unknown'))
                     name = row.get('Company', ticker)
-                    
                     mkt_cap = symbol_cap_map.get(ticker, 0)
                     
-                    item = {"ticker": ticker, "name": name, "cap": mkt_cap, "date": d}
+                    # FILTER: Only show companies with Market Cap > $5B
+                    if mkt_cap < 5_000_000_000:
+                        continue
+
+                    item = {
+                        "ticker": ticker, 
+                        "name": name, 
+                        "cap": mkt_cap, 
+                        "date": d,
+                        "time_reported": time_str # Keep this so we can display it later
+                    }
                     
-                    # Sort into Morning/Evening based on string
-                    # Yahoo usually says "After Market Close", "Before Market Open" or specific times
-                    lower_time = time_str.lower()
-                    if "after" in lower_time or "pm" in lower_time or "close" in lower_time:
-                         earnings_map[d]["evening"].append(item)
-                    else:
-                         # Default to morning for "Before Market Open" or unknown/unsupplied times
-                         earnings_map[d]["morning"].append(item)
+                    earnings_map[d].append(item)
                          
                 except: continue
                 
@@ -418,11 +437,11 @@ def get_weekly_earnings_calendar(progress_bar):
     # Sort and Finalize
     sorted_calendar = []
     for d in target_days:
-        earnings_map[d]["morning"].sort(key=lambda x: x['cap'], reverse=True)
-        earnings_map[d]["evening"].sort(key=lambda x: x['cap'], reverse=True)
+        # Sort entirely by Market Cap
+        earnings_map[d].sort(key=lambda x: x['cap'], reverse=True)
         
         # Only add days that have data
-        if earnings_map[d]["morning"] or earnings_map[d]["evening"]:
+        if earnings_map[d]:
              sorted_calendar.append({"date": d, "day": d.strftime("%A"), "data": earnings_map[d]})
             
     return sorted_calendar
@@ -836,28 +855,30 @@ elif st.session_state.active_mode == "earnings":
                 st.subheader(day_data['day'])
                 st.caption(day_data['date'].strftime('%b %d'))
                 
-                if day_data['data']['morning']:
-                    st.markdown("**☀️ Morning**")
-                    for stock in day_data['data']['morning']:
+                # Iterate through the UNIFIED list of data
+                if day_data['data']:
+                    for idx, stock in enumerate(day_data['data']):
                         b_col1, b_col2 = st.columns([2, 1])
-                        b_col1.write(f"**{stock['ticker']}**")
-                        if b_col2.button("Analyze", key=f"btn_m_{stock['ticker']}"):
+                        
+                        # Showing ticker and small time indicator
+                        # FIX: Check Evening terms FIRST to handle "AMC" (After Market Close) containing "am"
+                        t_str = stock['time_reported'].lower()
+                        if any(x in t_str for x in ["after", "pm", "close", "amc"]):
+                            time_hint = "🌙"
+                        elif any(x in t_str for x in ["before", "am", "open", "bmo"]):
+                            time_hint = "☀️"
+                        else:
+                            time_hint = "🕒"
+                        
+                        b_col1.markdown(f"**{stock['ticker']}** {time_hint}")
+                        
+                        # Unique Key using index to prevent any duplicate errors
+                        if b_col2.button("Analyze", key=f"btn_{stock['ticker']}_{idx}_{day_data['day']}"):
                             with st.spinner(f"Predicting {stock['ticker']} earnings..."):
                                 res = predict_earnings_outcome(client, stock['ticker'])
                                 st.session_state.earnings_analysis_queue.insert(0, res)
                                 st.rerun()
 
-                if day_data['data']['evening']:
-                    st.markdown("**🌙 Evening**")
-                    for stock in day_data['data']['evening']:
-                        b_col1, b_col2 = st.columns([2, 1])
-                        b_col1.write(f"**{stock['ticker']}**")
-                        if b_col2.button("Analyze", key=f"btn_e_{stock['ticker']}"):
-                            with st.spinner(f"Predicting {stock['ticker']} earnings..."):
-                                res = predict_earnings_outcome(client, stock['ticker'])
-                                st.session_state.earnings_analysis_queue.insert(0, res)
-                                st.rerun()
-                                
         st.divider()
         if st.session_state.earnings_analysis_queue:
             st.subheader("🔮 Earnings Prediction Queue")
